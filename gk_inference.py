@@ -11,7 +11,10 @@ app = modal.App("grape-inference-single")
 # Volume for storing berry data visualizations
 berry_volume = modal.Volume.from_name("berry-data", create_if_missing=True)
 
-# Modal image with all dependencies
+# NEW: Volume for model weights to avoid timeout
+model_volume = modal.Volume.from_name("model-weights", create_if_missing=True)
+
+# FIXED: Modal image WITHOUT the large model file
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install([
@@ -23,11 +26,23 @@ image = (
     .apt_install(["libglib2.0-0", "libsm6", "libxext6", "libxrender-dev", "libgomp1"])
     # Add model files
     .add_local_dir("app", "/app", copy=True)
-    # Add the checkpoint file
-    .add_local_file("weight/best_50_0.2.pth.tar", "/app/best_50_0.2.pth.tar", copy=True)
+    # REMOVED: Large model file - will use volume instead
+    # .add_local_file("weight/best_50_0.2.pth.tar", "/app/best_50_0.2.pth.tar", copy=True)
     # Add just the specific image we want to process
     .add_local_file("input_images/1.jpg", "/input_images/1.jpg", copy=True)
 )
+
+# NEW: Function to upload model weights (run once)
+@app.function(
+    image=image,
+    volumes={"/model_weights": model_volume},
+    timeout=1200
+)
+def upload_model_to_volume():
+    """Upload model weights to volume (run this once with local file)"""
+    print("To upload your model, run this command locally:")
+    print("modal volume put model-weights weight/best_50_0.2.pth.tar best_50_0.2.pth.tar")
+    return {"status": "use_cli_upload"}
 
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
     """Resize and pad image while meeting stride-multiple constraints"""
@@ -58,7 +73,7 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
         im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return im, ratio, (dw, dh)
 
 def preprocess_single_image(img_path):
@@ -78,6 +93,13 @@ def preprocess_single_image(img_path):
     img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # Add batch dimension
     
     return img_tensor
+
+def load_checkpoint(model, path):
+    """Load model checkpoint"""
+    state_dict = torch.load(path, map_location=torch.device('cpu'))
+    model.load_state_dict(state_dict['state_dict'])
+    epoch = state_dict['epoch']+1
+    return model, epoch
 
 def inference_single_image(model, img_path, val_score=0.7, mask_threshold=9e-3, device='cuda'):
     model.eval()
@@ -215,7 +237,10 @@ def create_visualizations(img_path, results, output_dir):
 
 @app.function(
     image=image,
-    volumes={"/berry_data": berry_volume},
+    volumes={
+        "/berry_data": berry_volume,
+        "/model_weights": model_volume  # NEW: Mount model volume
+    },
     gpu="A10G",
     timeout=600
 )
@@ -224,17 +249,21 @@ def test_different_thresholds():
     import sys
     sys.path.insert(0, '/app')
     
+    # FIXED: Import models directly
     from model_init import init_model
-    from train import load_checkpoint
     
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load model
+    # FIXED: Load model from volume
+    model_path = "/model_weights/best_50_0.2.pth.tar"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found at {model_path}. Upload with: modal volume put model-weights weight/best_50_0.2.pth.tar best_50_0.2.pth.tar")
+    
     print("Loading model...")
     model = init_model('Resnet50').to(device)
-    model, epoch = load_checkpoint(model, '/app/best_50_0.2.pth.tar')
+    model, epoch = load_checkpoint(model, model_path)
     print(f"Model loaded (epoch {epoch})")
     
     img_path = "/input_images/1.jpg"
@@ -253,7 +282,10 @@ def test_different_thresholds():
 
 @app.function(
     image=image,
-    volumes={"/berry_data": berry_volume},
+    volumes={
+        "/berry_data": berry_volume,
+        "/model_weights": model_volume  # NEW: Mount model volume
+    },
     gpu="A10G",
     timeout=600
 )
@@ -262,17 +294,21 @@ def run_single_image_inference():
     import sys
     sys.path.insert(0, '/app')
     
+    # FIXED: Import models directly
     from model_init import init_model
-    from train import load_checkpoint
     
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load model
+    # FIXED: Load model from volume instead of image
+    model_path = "/model_weights/best_50_0.2.pth.tar"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found at {model_path}. Upload with: modal volume put model-weights weight/best_50_0.2.pth.tar best_50_0.2.pth.tar")
+    
     print("Loading model...")
     model = init_model('Resnet50').to(device)
-    model, epoch = load_checkpoint(model, '/app/best_50_0.2.pth.tar')
+    model, epoch = load_checkpoint(model, model_path)
     print(f"Model loaded (epoch {epoch})")
     
     # Run inference on 1.jpg
